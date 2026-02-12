@@ -1,0 +1,28 @@
+# Core dependencies for Hybrid Decision Engine with LangGraph
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+numpy>=1.24.0
+
+# LangGraph and LangChain for agent-based architecture
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+
+# Additional utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+asyncio-throttle>=1.0.0
+aiofiles>=23.0.0
+
+# Optional: For enhanced notifications
+requests>=2.31.0
+websockets>=12.0
+
+# Optional: For database/memory persistence - sqlite3 is built-in
+
+# Model evaluation and metrics
+matplotlib>=3.7.0
+seaborn>=0.12.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
