@@ -88,6 +88,7 @@ intelligent-weapon-detection/
 - **'s'**: Save current frame snapshot
 - **'r'**: Reset system statistics
 - **'e'**: Open evidence folder
+- **'w'**: Reset evidence recording session
 
 ### System Interface
 

@@ -1,349 +1,147 @@
-"""
-Advanced Human Detection and ID Tracking with Memory-Based Occlusion Handling
-Uses DeepSORT-inspired algorithm for persistent tracking with JSON persistence
-"""
-
 import cv2
-from ultralytics import YOLO
 import numpy as np
-from datetime import datetime
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
 import time
-from collections import defaultdict, deque
-from typing import Dict, List, Any, Tuple, Optional
-from scipy.spatial.distance import cosine
-import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime
+import random
+from typing import List, Dict, Any
 
-# Import memory manager
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.person_memory_manager import PersonMemoryManager
+def load_model():
+    """Load YOLOv8 model"""
+    print("Loading YOLOv8 model...")
+    try:
+        return YOLO("yolov8n.pt")
+    except:
+        print("Downloading YOLOv8 model...")
+        return YOLO("yolov8n.yaml")
+
+def initialize_tracker():
+    """Initialize DeepSort tracker with enhanced occlusion handling"""
+    return DeepSort(
+        max_age=100,        # Increased from 50 to 100 frames (~3 seconds at 30fps)
+        n_init=3,           # Reduced from 5 to 3 for faster tracking
+        max_iou_distance=0.7,  # IoU threshold for matching
+        nn_budget=100,      # Feature memory budget
+        embedder="mobilenet",  # Use mobilenet embedder
+        embedder_gpu=False   # Use CPU to avoid numpy conflicts
+    )
+
+def get_color_for_id(track_id):
+    """Generate consistent random color for each track ID"""
+    random.seed(track_id)  # Seed with track ID for consistent colors
+    color = (
+        random.randint(50, 255),
+        random.randint(50, 255),
+        random.randint(50, 255)
+    )
+    return color
+
+def get_detections(frame, model, confidence_threshold=0.35):
+    """Get person detections from frame with occlusion handling"""
+    results = model(frame, conf=confidence_threshold)
+    detections = []
+    
+    for result in results:
+        boxes = result.boxes
+        if boxes is not None:
+            for box in boxes:
+                # Only detect people (class 0)
+                if box.cls == 0:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = box.conf[0].cpu().numpy()
+                    
+                    # Filter small detections (likely false positives)
+                    width = x2 - x1
+                    height = y2 - y1
+                    area = width * height
+                    
+                    # Minimum area threshold (adjust based on camera distance)
+                    min_area = 1000  # pixels
+                    
+                    if area > min_area:
+                        detections.append(([x1, y1, width, height], conf, 'person'))
+    
+    return detections
 
 class HumanTracker:
+    """Human Tracker using DeepSort algorithm"""
+    
     def __init__(self, model_path="yolov8n.pt", camera_index=0):
         """
-        Initialize Advanced Human Tracker with Memory-Based Occlusion Handling
+        Initialize Human Tracker with DeepSort
         
         Args:
             model_path: Path to YOLOv8 model
             camera_index: Camera index (default 0 for webcam)
         """
         # Load YOLOv8 model
-        self.model = YOLO(model_path)
-        print(f"✓ Advanced Human Tracker Model loaded: {model_path}")
+        self.model = load_model()
+        print(f"✓ Human Tracker Model loaded: {model_path}")
+        
+        # Initialize DeepSort tracker
+        self.tracker = initialize_tracker()
+        print("✓ DeepSort tracker initialized")
         
         # Camera setup
         self.camera_index = camera_index
         self.cap = None
         
-        # Advanced tracking parameters
-        self.frame_count = 0
-        self.next_person_id = 1
-        
-        # Memory system for occlusion handling
-        self.person_memory = {}  # Long-term memory
-        self.active_tracks = {}  # Currently visible tracks
-        self.lost_tracks = {}  # Recently lost tracks (for occlusion)
-        
-        # Initialize JSON memory manager
-        self.memory_manager = PersonMemoryManager()
-        
         # Tracking parameters
-        self.max_disappeared_frames = 30  # 1 second at 30fps
-        self.max_memory_time = 300  # 5 minutes memory
-        self.confidence_threshold = 0.5
-        self.iou_threshold = 0.4  # Intersection over Union for matching
-        self.feature_threshold = 0.7  # Feature similarity threshold
-        self.max_disappeared_time_seconds = 10  # Delete ID after 10 seconds
+        self.frame_count = 0
+        self.confidence_threshold = 0.35
         
         # Colors for visualization (consistent colors per ID)
         self.id_colors = {}  # Persistent colors per ID
     
-    def extract_features(self, frame: np.ndarray, bbox: List[int]) -> np.ndarray:
-        """
-        Extract appearance features from person region
-        
-        Args:
-            frame: Input frame
-            bbox: [x1, y1, w, h] bounding box
-            
-        Returns:
-            Feature vector
-        """
-        x1, y1, w, h = bbox
-        x2, y2 = x1 + w, y1 + h
-        
-        # Ensure bbox is within frame bounds
-        x1 = max(0, min(x1, frame.shape[1] - 1))
-        y1 = max(0, min(y1, frame.shape[0] - 1))
-        x2 = max(0, min(x2, frame.shape[1] - 1))
-        y2 = max(0, min(y2, frame.shape[0] - 1))
-        
-        # Extract person region
-        person_region = frame[y1:y2, x1:x2]
-        
-        if person_region.size == 0:
-            return np.zeros(128)  # Default feature
-        
-        # Resize to standard size
-        try:
-            person_region = cv2.resize(person_region, (32, 32))
-            
-            # Extract color histogram features
-            hist_b = cv2.calcHist([person_region], [0], [None], [16], [0, 256])
-            hist_g = cv2.calcHist([person_region], [1], [None], [16], [0, 256])
-            hist_r = cv2.calcHist([person_region], [2], [None], [16], [0, 256])
-            
-            # Normalize histograms
-            hist_b = hist_b.flatten() / (hist_b.sum() + 1e-8)
-            hist_g = hist_g.flatten() / (hist_g.sum() + 1e-8)
-            hist_r = hist_r.flatten() / (hist_r.sum() + 1e-8)
-            
-            # Combine features
-            features = np.concatenate([hist_b, hist_g, hist_r])
-            
-            return features
-            
-        except Exception:
-            return np.zeros(128)
-    
-    def calculate_iou(self, bbox1: List[int], bbox2: List[int]) -> float:
-        """Calculate Intersection over Union between two bounding boxes"""
-        x1_1, y1_1, w1, h1 = bbox1
-        x2_1, y2_1 = x1_1 + w1, y1_1 + h1
-        
-        x1_2, y1_2, w2, h2 = bbox2
-        x2_2, y2_2 = x1_2 + w2, y1_2 + h2
-        
-        # Calculate intersection
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
-        
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
-        
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
-        union = w1 * h1 + w2 * h2 - intersection
-        
-        return intersection / union if union > 0 else 0.0
-    
-    def match_detections_to_tracks(self, detections: List[Dict]) -> List[Tuple]:
-        """
-        Match current detections to existing tracks using Hungarian algorithm
-        
-        Returns:
-            List of (detection_idx, track_idx, match_score) tuples
-        """
-        matches = []
-        
-        for det_idx, detection in enumerate(detections):
-            det_bbox = detection['bbox']
-            det_features = detection.get('features', None)
-            
-            best_match = None
-            best_score = 0
-            
-            for track_id, track in self.active_tracks.items():
-                track_bbox = track['bbox']
-                
-                # Calculate IoU
-                iou = self.calculate_iou(det_bbox, track_bbox)
-                
-                # Calculate feature similarity if available
-                feature_sim = 0
-                if det_features is not None and 'features' in track:
-                    try:
-                        feature_sim = 1 - cosine(det_features, track['features'])
-                        feature_sim = max(0, feature_sim)
-                    except:
-                        feature_sim = 0
-                
-                # Combined score
-                combined_score = 0.6 * iou + 0.4 * feature_sim
-                
-                if combined_score > self.iou_threshold and combined_score > best_score:
-                    best_match = (det_idx, track_id, combined_score)
-                    best_score = combined_score
-            
-            if best_match:
-                matches.append(best_match)
-        
-        return matches
-    
     def detect_humans(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
-        Advanced human detection with memory-based occlusion handling and JSON persistence
+        Detect humans using DeepSort tracking
         
         Args:
             frame: Input frame
             
         Returns:
-            List of human detection dictionaries
+            List of human detection dictionaries with IDs
         """
         # Update frame count
         self.frame_count += 1
         
-        # Detect humans using YOLO
-        results = self.model(frame, stream=True, conf=self.confidence_threshold)
-        current_detections = []
+        # Get detections from YOLO
+        detections = get_detections(frame, self.model, self.confidence_threshold)
         
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                # Get class and confidence
-                conf = float(box.conf[0])
-                cls = int(box.cls[0])
-                class_name = self.model.names[cls]
-                
-                # Only process person detections
-                if class_name.lower() == 'person':
-                    # Bounding box coordinates
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    w, h = x2 - x1, y2 - y1
-                    
-                    # Extract features
-                    features = self.extract_features(frame, [x1, y1, w, h])
-                    
-                    detection = {
-                        'bbox': [x1, y1, w, h],
-                        'confidence': conf,
-                        'features': features,
-                        'center': (x1 + w // 2, y1 + h // 2)
-                    }
-                    
-                    current_detections.append(detection)
+        # Update tracker
+        tracks = self.tracker.update_tracks(detections, frame=frame)
         
-        # Match detections to existing tracks
-        matches = self.match_detections_to_tracks(current_detections)
-        
-        # Update matched tracks
-        matched_detections = set()
-        matched_tracks = set()
-        
-        for det_idx, track_id, score in matches:
-            detection = current_detections[det_idx]
-            track = self.active_tracks[track_id]
-            
-            # Update track with new detection
-            self.active_tracks[track_id] = {
-                'bbox': detection['bbox'],
-                'confidence': detection['confidence'],
-                'features': detection['features'],
-                'center': detection['center'],
-                'last_seen': self.frame_count,
-                'disappeared_count': 0,
-                'age': track.get('age', 0) + 1
-            }
-            
-            # Save to memory manager
-            self.memory_manager.add_or_update_person(
-                track_id, 
-                detection['features'], 
-                detection['bbox'], 
-                detection['confidence'],
-                self.frame_count,
-                self.camera_index
-            )
-            
-            matched_detections.add(det_idx)
-            matched_tracks.add(track_id)
-        
-        # Create new tracks for unmatched detections
-        for det_idx, detection in enumerate(current_detections):
-            if det_idx not in matched_detections:
-                # Try to find matching person from memory (JSON persistence)
-                matched_id = self.memory_manager.find_matching_person(
-                    detection['features'],
-                    detection['bbox'],
-                    detection['confidence'],
-                    self.max_disappeared_time_seconds
-                )
-                
-                if matched_id:
-                    # Use existing ID from memory
-                    person_id = matched_id
-                    print(f"🔄 Recovered person ID {person_id} from JSON memory")
-                else:
-                    # Assign new ID
-                    person_id = self.next_person_id
-                    self.next_person_id += 1
-                    print(f"➕ Assigned new person ID {person_id}")
-                
-                self.active_tracks[person_id] = {
-                    'bbox': detection['bbox'],
-                    'confidence': detection['confidence'],
-                    'features': detection['features'],
-                    'center': detection['center'],
-                    'last_seen': self.frame_count,
-                    'disappeared_count': 0,
-                    'age': 0
-                }
-                
-                # Save to memory manager
-                is_new_person = self.memory_manager.add_or_update_person(
-                    person_id, 
-                    detection['features'], 
-                    detection['bbox'], 
-                    detection['confidence'],
-                    self.frame_count,
-                    self.camera_index
-                )
-                
-                if is_new_person:
-                    print(f"🆕 Added new person {person_id} to JSON memory")
-        
-        # Handle unmatched tracks (potential occlusion)
-        for track_id in list(self.active_tracks.keys()):
-            if track_id not in matched_tracks:
-                track = self.active_tracks[track_id]
-                track['disappeared_count'] = track.get('disappeared_count', 0) + 1
-                
-                # If track has been missing for too long, move to lost tracks
-                if track['disappeared_count'] > self.max_disappeared_frames:
-                    # Mark as inactive in memory
-                    self.memory_manager.mark_person_inactive(track_id, "occlusion")
-                    
-                    # Move to lost tracks for potential recovery
-                    self.lost_tracks[track_id] = {
-                        **track,
-                        'lost_time': self.frame_count,
-                        'lost_timestamp': time.time()  # Add actual timestamp
-                    }
-                    del self.active_tracks[track_id]
-                else:
-                    # Keep in active tracks but update
-                    self.active_tracks[track_id] = track
-        
-        # Try to recover lost tracks
-        self.recover_lost_tracks(current_detections)
-        
-        # Clean old memory
-        self.memory_manager.cleanup_old_memory()
-        
-        # Save memory to JSON file periodically
-        if self.frame_count % 30 == 0:  # Save every 30 frames
-            self.memory_manager.force_save()
-        
-        # Convert to detection format
+        # Convert tracks to detection format
         final_detections = []
-        for track_id, track in self.active_tracks.items():
-            x1, y1, w, h = track['bbox']
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+                
+            track_id = track.track_id
+            bbox = track.to_ltrb()
+            x1, y1, x2, y2 = map(int, bbox)
+            w, h = x2 - x1, y2 - y1
+            
+            # Get track confidence
+            confidence = track.get_det_conf() if hasattr(track, 'get_det_conf') else 0.5
+            confidence = float(confidence) if confidence is not None else 0.5
             
             detection = {
                 "id": track_id,
                 "bbox": [x1, y1, w, h],
-                "person_conf": track['confidence'],
+                "person_conf": confidence,
                 "gun_conf": 0.0,
                 "knife_conf": 0.0,
                 "fight_conf": 0.0,
                 "meta": {
                     "class_name": "PERSON",
-                    "raw_confidence": track['confidence'],
+                    "raw_confidence": confidence,
                     "frame": self.frame_count,
-                    "camera": self.camera_index
+                    "camera": self.camera_index,
+                    "time_since_update": track.time_since_update if hasattr(track, 'time_since_update') else 0,
+                    "is_occluded": track.time_since_update > 0 if hasattr(track, 'time_since_update') else False
                 },
                 "timestamp": time.time(),
                 "frame": frame.copy()
@@ -353,136 +151,194 @@ class HumanTracker:
         
         return final_detections
     
-    def recover_lost_tracks(self, current_detections: List[Dict]):
-        """
-        Try to recover lost tracks using memory-based matching
-        
-        Args:
-            current_detections: Current frame detections
-        """
-        if not self.lost_tracks:
-            return
-        
-        recovered_tracks = []
-        
-        for lost_id, lost_track in list(self.lost_tracks.items()):
-            # Check if enough time has passed for recovery attempt
-            if self.frame_count - lost_track['lost_time'] > 10:  # Try recovery after 10 frames
-                continue
-            
-            # Try to match with current detections
-            best_match = None
-            best_score = 0
-            
-            for detection in current_detections:
-                # Skip if already matched
-                if detection.get('matched', False):
-                    continue
-                
-                # Calculate IoU with predicted position
-                iou = self.calculate_iou(detection['bbox'], lost_track['bbox'])
-                
-                # Calculate feature similarity
-                feature_sim = 0
-                if 'features' in detection and 'features' in lost_track:
-                    try:
-                        feature_sim = 1 - cosine(detection['features'], lost_track['features'])
-                        feature_sim = max(0, feature_sim)
-                    except:
-                        feature_sim = 0
-                
-                # Combined score with higher weight on features for occlusion recovery
-                combined_score = 0.3 * iou + 0.7 * feature_sim
-                
-                if combined_score > self.feature_threshold and combined_score > best_score:
-                    best_match = (detection, combined_score)
-                    best_score = combined_score
-            
-            # If good match found, recover the track
-            if best_match and best_score > 0.6:
-                detection, score = best_match
-                detection['matched'] = True  # Mark as matched
-                
-                # Recover track
-                self.active_tracks[lost_id] = {
-                    'bbox': detection['bbox'],
-                    'confidence': detection['confidence'],
-                    'features': detection['features'],
-                    'center': detection['center'],
-                    'last_seen': self.frame_count,
-                    'disappeared_count': 0,
-                    'age': lost_track.get('age', 0) + 1
-                }
-                
-                # Update memory
-                self.person_memory[lost_id] = {
-                    'features': detection['features'],
-                    'last_seen': self.frame_count,
-                    'bbox_history': lost_track.get('bbox_history', []) + [detection['bbox']][-10:],
-                    'confidence_history': lost_track.get('confidence_history', []) + [detection['confidence']][-5:]
-                }
-                
-                recovered_tracks.append(lost_id)
-                del self.lost_tracks[lost_id]
-                print(f"✓ Recovered track ID {lost_id} after occlusion (score: {best_score:.2f})")
-        
-        # Remove very old lost tracks
-        current_time = self.frame_count
-        self.lost_tracks = {
-            tid: track for tid, track in self.lost_tracks.items()
-            if current_time - track['lost_time'] < 100  # Keep for ~3 seconds
-        }
-    
-    def cleanup_memory(self):
-        """Clean up old memory entries and delete IDs after 10 seconds"""
-        current_time = self.frame_count
-        current_timestamp = time.time()
-        
-        # Clean person memory (keep for 5 minutes)
-        self.person_memory = {
-            pid: memory for pid, memory in self.person_memory.items()
-            if current_time - memory['last_seen'] < self.max_memory_time
-        }
-        
-        # Delete lost tracks that have been missing for more than 10 seconds
-        deleted_ids = []
-        for tid, track in list(self.lost_tracks.items()):
-            # Calculate time disappeared in seconds
-            disappeared_time_seconds = (current_timestamp - track.get('lost_timestamp', current_timestamp))
-            
-            if disappeared_time_seconds > self.max_disappeared_time_seconds:
-                deleted_ids.append(tid)
-                del self.lost_tracks[tid]
-                
-                # Remove from person memory as well
-                if tid in self.person_memory:
-                    del self.person_memory[tid]
-                
-                # Remove color assignment
-                if tid in self.id_colors:
-                    del self.id_colors[tid]
-                
-                print(f"✗ Deleted track ID {tid} after {disappeared_time_seconds:.1f} seconds disappearance")
-        
-        # Clean very old lost tracks (backup cleanup)
-        self.lost_tracks = {
-            tid: track for tid, track in self.lost_tracks.items()
-            if current_time - track['lost_time'] < 100  # Keep for ~3 seconds max
-        }
-    
-    def get_id_color(self, person_id: int) -> Tuple[int, int, int]:
+    def get_id_color(self, person_id: int) -> tuple:
         """Get consistent color for person ID"""
         if person_id not in self.id_colors:
             # Generate consistent color based on ID
-            np.random.seed(person_id)  # Seed with ID for consistency
-            self.id_colors[person_id] = (
-                np.random.randint(50, 255),  # Avoid too dark colors
-                np.random.randint(50, 255),
-                np.random.randint(50, 255)
-            )
+            self.id_colors[person_id] = get_color_for_id(person_id)
         
         return self.id_colors[person_id]
     
     def update_frame_count(self):
         """Update frame counter"""
         self.frame_count += 1
+    
+    def draw_tracking_info(self, frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
+        """
+        Draw tracking information on frame
+        
+        Args:
+            frame: Input frame
+            detections: List of detections
+            
+        Returns:
+            Frame with tracking information drawn
+        """
+        annotated = frame.copy()
+        
+        # Draw information overlay
+        current_count = len(detections)
+        unique_ids = set([d["id"] for d in detections])
+        unique_count = len(unique_ids)
+        
+        # Draw background for text
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (10, 10), (400, 100), (0, 0, 0), -1)
+        annotated = cv2.addWeighted(annotated, 0.7, overlay, 0.3, 0)
+        
+        # Draw text
+        cv2.putText(annotated, f"Current People: {current_count}", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(annotated, f"Total Unique: {unique_count}", (20, 70), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(annotated, f"Time: {datetime.now().strftime('%H:%M:%S')}", (20, 100), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Draw bounding boxes and IDs for each detection
+        for detection in detections:
+            track_id = detection["id"]
+            x1, y1, w, h = detection["bbox"]
+            x2, y2 = x1 + w, y1 + h
+            
+            # Get unique color for this person
+            color = self.get_id_color(track_id)
+            
+            # Check if track is occluded
+            is_occluded = detection["meta"].get("is_occluded", False)
+            time_since_update = detection["meta"].get("time_since_update", 0)
+            
+            # Draw bounding box with unique color
+            if is_occluded:
+                # Draw dashed bounding box for occluded person
+                dash_length = 10
+                for i in range(x1, x2, dash_length * 2):
+                    start_x = min(i, x2)
+                    end_x = min(i + dash_length, x2)
+                    cv2.line(annotated, (start_x, y1), (end_x, y1), color, 3)
+                    cv2.line(annotated, (start_x, y2), (end_x, y2), color, 3)
+                
+                for i in range(y1, y2, dash_length * 2):
+                    start_y = min(i, y2)
+                    end_y = min(i + dash_length, y2)
+                    cv2.line(annotated, (x1, start_y), (x1, end_y), color, 3)
+                    cv2.line(annotated, (x2, start_y), (x2, end_y), color, 3)
+            else:
+                # Solid bounding box for visible person
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+            
+            # Draw ID and label
+            if is_occluded:
+                label = f"Person {track_id} - OCCLUDED ({time_since_update}f)"
+                label_color = (0, 0, 255)  # Red for occluded
+            else:
+                label = f"Person {track_id}"
+                label_color = color
+            
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            
+            # Draw colored background for label
+            cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10), 
+                         (x1 + label_size[0], y1), label_color, -1)
+            
+            # Draw text in white for contrast
+            cv2.putText(annotated, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Draw center point
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            
+            if is_occluded:
+                # Draw X for occluded person
+                cv2.drawMarker(annotated, (center_x, center_y), label_color, 
+                             cv2.MARKER_CROSS, 10, 3)
+            else:
+                # Draw filled circle for visible person
+                cv2.circle(annotated, (center_x, center_y), 5, color, -1)
+                cv2.circle(annotated, (center_x, center_y), 7, (255, 255, 255), 1)
+        
+        return annotated
+
+def main():
+    """Main function to run camera tracking"""
+    print("🎯 Starting People Tracking System...")
+    print("Press 'q' to quit, 's' to save screenshot")
+    
+    # Initialize tracker
+    tracker = HumanTracker()
+    
+    # Initialize camera
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Error: Could not open camera")
+        return
+    
+    # Set camera properties
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    
+    print("✅ Camera initialized successfully")
+    print("📹 Starting live feed...")
+    
+    # Tracking variables
+    unique_people = set()
+    frame_count = 0
+    start_time = time.time()
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ Error: Could not read frame")
+            break
+        
+        frame_count += 1
+        
+        # Detect and track humans
+        detections = tracker.detect_humans(frame)
+        
+        # Draw tracking information
+        frame = tracker.draw_tracking_info(frame, detections)
+        
+        # Update unique people set
+        for detection in detections:
+            unique_people.add(detection["id"])
+        
+        # Calculate FPS
+        if frame_count % 10 == 0:
+            elapsed_time = time.time() - start_time
+            fps = frame_count / elapsed_time
+            cv2.putText(frame, f"FPS: {fps:.1f}", (frame.shape[1] - 120, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        # Show frame
+        cv2.imshow("People Tracking System", frame)
+        
+        # Handle key presses
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("👋 Quitting...")
+            break
+        elif key == ord('s'):
+            # Save screenshot
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"people_tracking_{timestamp}.jpg"
+            cv2.imwrite(filename, frame)
+            print(f"📸 Screenshot saved: {filename}")
+    
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    print(f"\n📊 Session Summary:")
+    print(f"   Total Frames: {frame_count}")
+    print(f"   Total Unique People: {len(unique_people)}")
+    print(f"   Session Duration: {time.time() - start_time:.1f} seconds")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n👋 Program interrupted by user")
+    except Exception as e:
+        print(f"❌ Error: {e}")

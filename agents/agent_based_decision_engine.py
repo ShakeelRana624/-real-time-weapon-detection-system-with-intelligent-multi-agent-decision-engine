@@ -326,7 +326,7 @@ class PerceptionAgent:
         
         # Check confidence thresholds
         for key in ["person_conf", "gun_conf", "knife_conf", "fight_conf"]:
-            if key in validated and validated[key] < self.validation_rules["min_confidence"]:
+            if key in validated and validated[key] is not None and validated[key] < self.validation_rules["min_confidence"]:
                 validated[key] = 0.0
         
         # Validate bounding box
@@ -685,9 +685,9 @@ class DecisionCoordinatorAgent:
 class EvidenceAgent:
     """Intelligent video evidence collection agent with frame buffering"""
     
-    def __init__(self, buffer_size: int = 30, fps: int = 20):
+    def __init__(self, buffer_size: int = 30, fps: int = 30):  # Changed fps to 30 for normal speed
         self.buffer_size = buffer_size  # Number of frames to buffer before detection
-        self.fps = fps
+        self.fps = fps  # Normal speed recording
         self.frame_buffer = deque(maxlen=buffer_size)
         self.video_writer = None
         self.current_recording = None
@@ -703,11 +703,12 @@ class EvidenceAgent:
         # Ensure storage directory exists
         os.makedirs(self.storage_path, exist_ok=True)
         
-        # Recording states
+        # Recording states - FIXED: Only one recording at a time
         self.is_recording = False
         self.weapon_detected = False
         self.normal_state_counter = 0
-        self.normal_state_threshold = 10  # Frames of normal state to stop recording
+        self.normal_state_threshold = 5  # Frames of normal state to stop recording (reduced)
+        self.recording_completed = False  # Track if recording is completed for this session
     
     def add_frame_to_buffer(self, frame: np.ndarray, timestamp: float = None):
         """Add frame to circular buffer for pre-detection evidence"""
@@ -721,7 +722,7 @@ class EvidenceAgent:
         self.frame_buffer.append(frame_data)
     
     def process(self, state: AgentState) -> AgentState:
-        """Process evidence collection with intelligent video capture"""
+        """Process evidence collection with intelligent video capture - FIXED LOGIC"""
         decision = state.get("decision", {})
         detection = state["detection"]
         current_frame = detection.get("frame")
@@ -743,11 +744,13 @@ class EvidenceAgent:
         # Check if weapon detected
         weapon_detected = self._is_weapon_detected(detection)
         
-        if weapon_detected and not self.is_recording:
+        # FIXED LOGIC: Only record when weapon is detected, and only one recording
+        if weapon_detected and not self.is_recording and not self.recording_completed:
             # Start recording with buffered frames
             self._start_recording(detection)
             self.weapon_detected = True
             self.last_detection_time = time.time()
+            print(f"🎯 Weapon detected! Started recording evidence")
         
         elif self.is_recording:
             if weapon_detected:
@@ -760,6 +763,8 @@ class EvidenceAgent:
                 self.normal_state_counter += 1
                 if self.normal_state_counter >= self.normal_state_threshold:
                     self._stop_recording()
+                    self.recording_completed = True  # Mark as completed to prevent new recordings
+                    print(f"✅ Weapon no longer detected. Recording completed.")
                 else:
                     self._continue_recording(current_frame, detection, self.current_result)
         
@@ -863,6 +868,7 @@ class EvidenceAgent:
             self.recording_start_time = None
             self.weapon_detected = False
             self.normal_state_counter = 0
+            # Note: recording_completed is set in the process method to control timing
     
     def _annotate_frame(self, frame: np.ndarray, timestamp: float, status: str, 
                         detection: Dict[str, Any] = None, result: Dict[str, Any] = None) -> np.ndarray:
@@ -1022,6 +1028,14 @@ class EvidenceAgent:
         if self.is_recording:
             self._stop_recording()
     
+    def reset_session(self):
+        """Reset evidence agent for new recording session"""
+        with self.recording_lock:
+            self.recording_completed = False
+            self.normal_state_counter = 0
+            self.weapon_detected = False
+            print("🔄 EvidenceAgent: Reset for new session - ready to record next weapon detection")
+    
     def get_status(self) -> Dict[str, Any]:
         """Get current evidence agent status"""
         return {
@@ -1030,7 +1044,8 @@ class EvidenceAgent:
             "buffered_frames": len(self.frame_buffer),
             "recording_duration": self._calculate_recording_duration(),
             "weapon_detected": self.weapon_detected,
-            "normal_state_counter": self.normal_state_counter
+            "normal_state_counter": self.normal_state_counter,
+            "recording_completed": self.recording_completed
         }
 
 class NotificationAgent:
@@ -1336,9 +1351,10 @@ class AgentBasedDecisionEngine:
             )
     
     def _execute_evidence_collection(self, evidence: Dict[str, Any], detection: Dict[str, Any]):
-        """Execute evidence collection"""
-        detection_id = detection.get("id")
-        self.legacy_engine._save_evidence_stub(detection_id, detection)
+        """Execute evidence collection - DISABLED: Now handled by EvidenceAgent"""
+        # Evidence collection is now handled by EvidenceAgent.process()
+        # This stub is disabled to prevent duplicate evidence saving
+        pass
     
     def _format_result(self, state: AgentState) -> Dict[str, Any]:
         """Format result to be compatible with original engine interface"""

@@ -18,6 +18,8 @@ from ultralytics import YOLO
 # Import our agent-based decision engine
 from agents.agent_based_decision_engine import AgentBasedDecisionEngine
 from detection.human_tracker import HumanTracker
+from pose_detection import PoseDetector
+from fight_detection import FightDetector
 
 class IntegratedGunDetectionSystem:
     """Complete integrated system with YOLO detection and agent-based decision making"""
@@ -34,6 +36,14 @@ class IntegratedGunDetectionSystem:
         # Initialize human tracker
         self.human_tracker = HumanTracker()
         print("✓ Human tracker initialized")
+        
+        # Initialize pose detector
+        self.pose_detector = PoseDetector()
+        print("✓ Pose detector initialized")
+        
+        # Initialize fight detector
+        self.fight_detector = FightDetector()
+        print("✓ Fight detector initialized")
         
         # Get reference to evidence agent for direct frame buffering
         self.evidence_agent = self.decision_engine.evidence_agent
@@ -61,7 +71,9 @@ class IntegratedGunDetectionSystem:
             "total_detections": 0,
             "threat_detections": 0,
             "alerts_triggered": 0,
-            "evidence_saved": 0
+            "evidence_saved": 0,
+            "hands_up_detections": 0,
+            "fight_detections": 0
         }
     
     def init_evidence_storage(self):
@@ -247,10 +259,57 @@ class IntegratedGunDetectionSystem:
         """Process detections through agent-based decision engine"""
         results = []
         
+        # Store detection history for people counting
+        if not hasattr(self, 'detection_history'):
+            self.detection_history = []
+        self.detection_history.append(detections)
+        self.detection_history = self.detection_history[-100:]  # Keep last 100 frames
+        
         # Add frame to evidence buffer for all frames (not just weapon detections)
         self.evidence_agent.add_frame_to_buffer(frame, time.time())
         
+        # Detect poses for all persons in frame
+        person_detections = [d for d in detections if d.get("class_name") == "PERSON"]
+        if person_detections:
+            # Detect poses
+            pose_results = self.pose_detector.detect_poses_in_frame(frame, person_detections)
+            
+            # Update hands-up statistics
+            hands_up_count = self.pose_detector.get_hands_up_count()
+            if hands_up_count > self.stats.get("hands_up_detections", 0):
+                self.stats["hands_up_detections"] = hands_up_count
+                
+                # Print hands-up detection info
+                hands_up_ids = self.pose_detector.get_hands_up_person_ids()
+                print(f"🙋 HANDS-UP DETECTED: {hands_up_count} persons with hands up (IDs: {hands_up_ids})")
+            
+            # Detect fights
+            fight_results = self.fight_detector.detect_fights_in_frame(frame, person_detections)
+            
+            # Update fight statistics
+            fight_count = self.fight_detector.get_fight_count()
+            if fight_count > self.stats.get("fight_detections", 0):
+                self.stats["fight_detections"] = fight_count
+                
+                # Print fight detection info
+                fighting_ids = self.fight_detector.get_fighting_person_ids()
+                print(f"🥊 FIGHT DETECTED: {fight_count} persons fighting (IDs: {fighting_ids})")
+        
         for detection in detections:
+            # Add pose information to detection if available
+            person_id = detection.get("id")
+            if person_id and person_id in self.pose_detector.detected_poses:
+                pose_info = self.pose_detector.detected_poses[person_id]
+                detection["pose_type"] = pose_info.get("pose_type", "NORMAL")
+                detection["pose_confidence"] = pose_info.get("confidence", 0.0)
+                detection["pose_keypoints"] = pose_info.get("keypoints", [])
+            
+            # Add fight information to detection if available
+            if person_id and person_id in self.fight_detector.detected_fights:
+                fight_info = self.fight_detector.detected_fights[person_id]
+                detection["fight_detected"] = fight_info.get("fight_detected", False)
+                detection["fight_confidence"] = fight_info.get("confidence", 0.0)
+            
             # Process through agent engine
             result = self.decision_engine.process(detection)
             results.append(result)
@@ -388,6 +447,62 @@ class IntegratedGunDetectionSystem:
         cv2.putText(annotated, label, (x + 10, y - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(annotated, score_text, (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         
+        # Add fight information if available
+        fight_detected = detection.get("fight_detected", False)
+        fight_confidence = detection.get("fight_confidence", 0.0)
+        
+        if fight_detected:
+            # Draw fight detection with red styling
+            fight_color = (0, 0, 255)  # Red for fight
+            fight_label = f"🥊 FIGHT ID:{detection['id']}"
+            fight_conf_text = f"Fight:{fight_confidence:.2f}"
+            
+            # Draw fight indicator above all other elements
+            fight_label_size = cv2.getTextSize(fight_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.rectangle(annotated, (x, y - 105), (x + fight_label_size[0] + 10, y - 80), fight_color, -1)
+            cv2.putText(annotated, fight_label, (x + 5, y - 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(annotated, fight_conf_text, (x + 5, y - 68), cv2.FONT_HERSHEY_SIMPLEX, 0.4, fight_color, 1)
+            
+            # Draw warning text
+            cv2.putText(annotated, "⚠️ VIOLENCE DETECTED", (x, y - 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, fight_color, 2)
+            
+            # Draw fight skeleton on frame
+            fight_info = {
+                "person_id": detection['id'],
+                "fight_detected": fight_detected,
+                "confidence": fight_confidence,
+                "bbox": bbox
+            }
+            annotated = self.fight_detector.draw_fight_on_frame(annotated, fight_info, fight_color)
+        
+        # Add pose information if available
+        pose_type = detection.get("pose_type", "NORMAL")
+        pose_confidence = detection.get("pose_confidence", 0.0)
+        
+        if pose_type == "HANDS_UP":
+            # Draw hands-up indicator with special styling
+            pose_color = (0, 255, 255)  # Yellow for hands-up
+            pose_label = f"🙋 HANDS_UP"
+            pose_conf_text = f"Pose:{pose_confidence:.2f}"
+            
+            # Draw pose indicator above bounding box (but below fight indicator)
+            pose_label_size = cv2.getTextSize(pose_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(annotated, (x, y - 85), (x + pose_label_size[0] + 10, y - 60), pose_color, -1)
+            cv2.putText(annotated, pose_label, (x + 5, y - 68), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            cv2.putText(annotated, pose_conf_text, (x + 5, y - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, pose_color, 1)
+            
+            # Draw pose skeleton on frame
+            pose_keypoints = detection.get("pose_keypoints", [])
+            if pose_keypoints:
+                pose_info = {
+                    "person_id": detection['id'],
+                    "pose_type": pose_type,
+                    "confidence": pose_confidence,
+                    "keypoints": pose_keypoints,
+                    "bbox": bbox
+                }
+                annotated = self.pose_detector.draw_pose_on_frame(annotated, pose_info, pose_color)
+        
         # Add weapon confidence indicators
         confidences = []
         if detection.get("gun_conf", 0) > 0.1:
@@ -499,7 +614,7 @@ class IntegratedGunDetectionSystem:
         cv2.rectangle(stats_frame, (0, height - 40), (width, height), (0, 255, 0), 1)
         
         # Controls info
-        controls = "[Q] Quit [S] Save [R] Reset [E] Evidence"
+        controls = "[Q] Quit [S] Save [R] Reset [E] Evidence [W] Reset Recording"
         cv2.putText(stats_frame, controls, (20, height - 15), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
         
@@ -578,17 +693,20 @@ class IntegratedGunDetectionSystem:
             # Calculate activity density with higher resolution
             activity_grid = np.zeros((8, 12), dtype=float)  # Higher resolution grid
             
-            for detection in detections_history[-100:]:  # Last 100 detections
-                bbox = detection.get("bbox", [0, 0, 0, 0])
-                if len(bbox) >= 4:
-                    x, y, w, h = bbox[:4]
-                    center_x = int((x + w/2) / frame.shape[1] * 12)
-                    center_y = int((y + h/2) / frame.shape[0] * 8)
-                    
-                    if 0 <= center_x < 12 and 0 <= center_y < 8:
-                        # Add weighted contribution based on threat score
-                        threat_score = detection.get("threat_score", 1.0)
-                        activity_grid[center_y, center_x] += threat_score
+            for detection_batch in detections_history[-100:]:  # Last 100 detection batches
+                if isinstance(detection_batch, list):  # Check if it's a list of detections
+                    for detection in detection_batch:
+                        if isinstance(detection, dict):  # Check if it's a detection dictionary
+                            bbox = detection.get("bbox", [0, 0, 0, 0])
+                            if len(bbox) >= 4:
+                                x, y, w, h = bbox[:4]
+                                center_x = int((x + w/2) / frame.shape[1] * 12)
+                                center_y = int((y + h/2) / frame.shape[0] * 8)
+                                
+                                if 0 <= center_x < 12 and 0 <= center_y < 8:
+                                    # Add weighted contribution based on threat score
+                                    threat_score = detection.get("threat_score", 0.5)
+                                    activity_grid[center_y, center_x] += threat_score
             
             # Apply Gaussian smoothing for better visualization
             from scipy.ndimage import gaussian_filter
@@ -690,14 +808,41 @@ class IntegratedGunDetectionSystem:
         system_state = current_state.current_state.value if current_state else "UNKNOWN"
         
         # Analytics data
+        hands_up_count = self.pose_detector.get_hands_up_count()
+        hands_up_ids = self.pose_detector.get_hands_up_person_ids()
+        fight_count = self.fight_detector.get_fight_count()
+        fighting_ids = self.fight_detector.get_fighting_person_ids()
+        
+        # Get current and total people count
+        self.current_detections = detections  # Store current detections
+        current_people = len([d for d in detections if d.get("meta", {}).get("class_name") == "PERSON"])
+        all_person_ids = set()
+        if hasattr(self, 'detection_history'):
+            for detection_batch in self.detection_history[-100:]:  # Last 100 frames
+                if isinstance(detection_batch, list):  # Check if it's a list of detections
+                    for detection in detection_batch:
+                        if isinstance(detection, dict) and detection.get("meta", {}).get("class_name") == "PERSON":
+                            all_person_ids.add(detection.get("id", 0))
+        total_unique_people = len(all_person_ids)
+        
         analytics_data = [
             ("System State:", system_state.upper(), self.get_system_state_color(system_state.upper())),
             ("", "", (255, 255, 255)),
             ("📊 Statistics", "", (0, 255, 0)),
             ("Total:", str(self.stats['total_detections']), (255, 255, 255)),
             ("Threat:", str(self.stats['threat_detections']), (255, 165, 0)),
+            ("Current People:", str(current_people), (0, 255, 0)),  # Added current people count
+            ("Total Unique:", str(total_unique_people), (0, 255, 255)),  # Added total unique people
+            ("Hands-Up:", str(hands_up_count), (0, 255, 255)),
+            ("Fights:", str(fight_count), (0, 0, 255)),  # Added fight count
             ("Threat Rate:", f"{(self.stats['threat_detections']/max(1,self.stats['total_detections'])*100):.1f}%", (255, 165, 0)),
             ("Evidence:", str(len([f for f in os.listdir("evidence/videos") if f.endswith(".mp4")])), (0, 255, 255)),
+            ("", "", (255, 255, 255)),
+            ("🙋 Pose Status", "", (0, 255, 255)),
+            (f"Active IDs:", str(hands_up_ids) if hands_up_ids else "None", (0, 255, 255)),
+            ("", "", (255, 255, 255)),
+            ("🥊 Fight Status", "", (0, 0, 255)),  # Added fight status section
+            (f"Fighting IDs:", str(fighting_ids) if fighting_ids else "None", (0, 0, 255)),
             ("", "", (255, 255, 255)),
             ("⚡ Performance", "", (0, 255, 0)),
             ("FPS:", "30.0", (0, 255, 0)),
@@ -796,13 +941,46 @@ class IntegratedGunDetectionSystem:
             # Get consistent color from human tracker
             color = self.human_tracker.get_id_color(person_id)
             
-            # Draw bounding box
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            # Check if track is occluded (from DeepSort)
+            is_occluded = detection.get("meta", {}).get("is_occluded", False)
+            time_since_update = detection.get("meta", {}).get("time_since_update", 0)
+            
+            # Draw bounding box with occlusion handling
+            if is_occluded:
+                # Draw dashed bounding box for occluded person
+                dash_length = 10
+                for i in range(x1, x2, dash_length * 2):
+                    start_x = min(i, x2)
+                    end_x = min(i + dash_length, x2)
+                    cv2.line(annotated_frame, (start_x, y1), (end_x, y1), color, 3)
+                    cv2.line(annotated_frame, (start_x, y2), (end_x, y2), color, 3)
+                
+                for i in range(y1, y2, dash_length * 2):
+                    start_y = min(i, y2)
+                    end_y = min(i + dash_length, y2)
+                    cv2.line(annotated_frame, (x1, start_y), (x1, end_y), color, 3)
+                    cv2.line(annotated_frame, (x2, start_y), (x2, end_y), color, 3)
+                
+                # Red dot indicator for occluded person
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+                cv2.drawMarker(annotated_frame, (center_x, center_y), (0, 0, 255), 
+                             cv2.MARKER_CROSS, 10, 3)
+                
+                # Occlusion label
+                label_text = f"PERSON {person_id} - OCCLUDED ({time_since_update}f)"
+                label_color = (0, 0, 255)  # Red for occluded
+            else:
+                # Solid bounding box for visible person
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Normal label
+                label_text = f"PERSON {person_id} {confidence:.0f}%"
+                label_color = color
             
             # Draw label background and text
-            label_text = f"PERSON {person_id} {confidence:.0f}%"
             label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
-            cv2.rectangle(annotated_frame, (x1, y1 - 25), (x1 + label_size[0], y1), color, -1)
+            cv2.rectangle(annotated_frame, (x1, y1 - 25), (x1 + label_size[0], y1), label_color, -1)
             
             # Draw label text in white
             cv2.putText(annotated_frame, label_text, (x1, y1 - 8), 
@@ -869,12 +1047,6 @@ class IntegratedGunDetectionSystem:
         full_screen[60:240, 800:1040] = birds_eye_small
         
         # Section 3: Enhanced Heatmap (Bottom Right - 240x180) - Smaller but Enhanced
-        # Store detection history for heatmap
-        if not hasattr(self, 'detection_history'):
-            self.detection_history = []
-        self.detection_history.extend(detections)
-        self.detection_history = self.detection_history[-100:]  # Keep last 100
-        
         heatmap = self.create_enhanced_heatmap(frame, self.detection_history)
         heatmap_small = cv2.resize(heatmap, (240, 180))
         full_screen[240:420, 800:1040] = heatmap_small
@@ -977,6 +1149,8 @@ class IntegratedGunDetectionSystem:
                     self.reset_statistics()
                 elif key == ord('e'):
                     self.open_evidence_folder()
+                elif key == ord('w'):
+                    self.reset_evidence_session()  # Reset evidence recording session
         
         except KeyboardInterrupt:
             print("\nDetection stopped by user")
@@ -998,8 +1172,14 @@ class IntegratedGunDetectionSystem:
             "total_detections": 0,
             "threat_detections": 0,
             "alerts_triggered": 0,
-            "evidence_saved": 0
+            "evidence_saved": 0,
+            "hands_up_detections": 0,
+            "fight_detections": 0
         }
+        # Clear pose detector poses
+        self.pose_detector.clear_poses()
+        # Clear fight detector fights
+        self.fight_detector.clear_fights()
         print("✓ Statistics reset")
     
     def open_evidence_folder(self):
@@ -1014,6 +1194,14 @@ class IntegratedGunDetectionSystem:
             print(f"✓ Evidence folder opened: {self.evidence_folder}")
         except Exception as e:
             print(f"Could not open evidence folder: {e}")
+    
+    def reset_evidence_session(self):
+        """Reset evidence recording session for new weapon detection"""
+        if hasattr(self, 'evidence_agent'):
+            self.evidence_agent.reset_session()
+            print("✓ Evidence recording session reset - Ready for next weapon detection")
+        else:
+            print("❌ Evidence agent not available")
     
     def cleanup(self):
         """Cleanup resources"""
